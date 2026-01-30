@@ -245,5 +245,5 @@ def merge_background(dynamic_df: pd.DataFrame, bg_df: Optional[pd.DataFrame]) ->
     bg = bg_df.sort_values("timestamp").copy()
     # asof merge: for each dynamic timestamp, take last bg value
     merged = pd.merge_asof(d, bg, on="timestamp", direction="backward")
-    merged["bg_app_count"] = merged["bg_app_count"].fillna(method="ffill").fillna(0.0)
+    merged["bg_app_count"] = merged["bg_app_count"].ffill().fillna(0.0)
     return merged
