@@ -137,19 +137,19 @@ def build_default_argv() -> Optional[list[str]]:
 # Core pipeline functions
 # --------------------------
 
-def select_longest_discharge_segment(df: pd.DataFrame, gap_s: float = 120.0) -> pd.DataFrame:
+def find_discharge_segments(df: pd.DataFrame, gap_s: float = 120.0, min_len: int = 50) -> list[pd.DataFrame]:
     """
-    Daily dataset may contain charging periods. For the SOC ODE (discharge),
-    we select the longest continuous segment that looks like discharge:
+    Split the day into continuous segments and return those that look like DISCHARGE.
 
+    Discharge heuristic (same as before):
       battery_connection_status == 0   (unplugged)
       p_load_W_meas > 0.02
-      battery_current_A < 0  (discharge sign)
+      battery_current_A < 0          (discharge sign)
 
     gap_s: split segments when timestamp gap is larger than this.
+    min_len: minimum raw rows in a segment.
     """
     d = df.sort_values("timestamp").copy()
-    # Make sure these columns exist
     if "battery_connection_status" not in d.columns:
         d["battery_connection_status"] = 0
     if "battery_current_A" not in d.columns:
@@ -166,37 +166,135 @@ def select_longest_discharge_segment(df: pd.DataFrame, gap_s: float = 120.0) -> 
     split = (dt > float(gap_s)) | (discharge != discharge.shift(1).fillna(False))
     seg_id = split.cumsum()
 
-    best = None
-    best_dur = -1.0
+    segs: list[pd.DataFrame] = []
     for _, g in d.groupby(seg_id):
+        if len(g) < int(min_len):
+            continue
         if not bool(discharge.loc[g.index].iloc[0]):
             continue
-        dur = (g["timestamp"].iloc[-1] - g["timestamp"].iloc[0]).total_seconds()
-        if dur > best_dur and len(g) >= 50:
-            best_dur = dur
-            best = g
+        segs.append(g.copy())
+    return segs
 
-    if best is None:
-        # fall back: just use rows with positive load power
+
+def _score_segment(g: pd.DataFrame) -> tuple[float, dict]:
+    """Score a discharge segment: prefer usable SOC variation + some activity (screen/network)."""
+    t0 = g["timestamp"].iloc[0]
+    t1 = g["timestamp"].iloc[-1]
+    dur_s = float((t1 - t0).total_seconds())
+
+    soc = pd.to_numeric(g.get("soc_meas", np.nan), errors="coerce").dropna()
+    if len(soc) >= 2:
+        soc_start = float(soc.iloc[0])
+        soc_end = float(soc.iloc[-1])
+        soc_range = float(soc.max() - soc.min())
+    elif len(soc) == 1:
+        soc_start = float(soc.iloc[0]); soc_end = float(soc.iloc[0]); soc_range = 0.0
+    else:
+        soc_start = np.nan; soc_end = np.nan; soc_range = 0.0
+
+    screen = pd.to_numeric(g.get("screen_on", 0.0), errors="coerce").fillna(0.0)
+    screen_frac = float((screen > 0.5).mean()) if len(screen) else 0.0
+
+    net = pd.to_numeric(g.get("net", 0.0), errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    net_std = float(net.std()) if len(net) else 0.0
+
+    cpu = pd.to_numeric(g.get("cpu", 0.0), errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    cpu_std = float(cpu.std()) if len(cpu) else 0.0
+
+    # Main idea: if a segment starts at very low SOC (e.g. 7%) and SOC barely changes,
+    # then the *measured* SOC line becomes almost flat (percentage quantization), which makes
+    # the "measured vs simulated" plot misleading. Prefer segments with higher SOC and more SOC variation.
+    soc_start_score = 0.0 if not np.isfinite(soc_start) else float(soc_start)
+    score = (
+        20.0 * float(soc_range)
+        + 5.0 * soc_start_score
+        + 2.0 * float(screen_frac)
+        + 0.2 * float(net_std)
+        + 0.02 * float(cpu_std)
+        + 0.002 * (dur_s / 60.0)
+    )
+
+    info = {
+        "t_start": t0,
+        "t_end": t1,
+        "dur_min": dur_s / 60.0,
+        "soc_start": soc_start,
+        "soc_end": soc_end,
+        "soc_range": soc_range,
+        "screen_frac": screen_frac,
+        "net_std": net_std,
+        "cpu_std": cpu_std,
+        "score": score,
+        "n_rows": int(len(g)),
+    }
+    return score, info
+
+
+def select_best_discharge_segment(df: pd.DataFrame, gap_s: float = 120.0, verbose: bool = True) -> tuple[pd.DataFrame, list[dict]]:
+    """
+    Instead of always taking the *longest* discharge segment, choose a "best" segment
+    for evaluation (plots/metrics) using a score that prefers:
+      - higher starting SOC
+      - more SOC variation (avoids a flat measured SOC line)
+      - some usage activity (screen/network)
+      - still keeps reasonable duration
+
+    Returns (best_segment_df, segment_infos_sorted_by_score_desc).
+    """
+    segs = find_discharge_segments(df, gap_s=gap_s, min_len=50)
+    if len(segs) == 0:
+        d = df.sort_values("timestamp").copy()
         best = d[d["p_load_W_meas"] > 0.02].copy()
-    return best
+        return best, []
+
+    scored: list[tuple[float, pd.DataFrame, dict]] = []
+    for g in segs:
+        sc, info = _score_segment(g)
+        scored.append((sc, g, info))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    infos = [x[2] for x in scored]
+    best = scored[0][1]
+
+    if verbose:
+        print("[segment] Candidate discharge segments (top 5 by score):")
+        show = infos[: min(5, len(infos))]
+        # Pretty print without huge timestamps
+        for k, inf in enumerate(show, start=1):
+            print(
+                f"  #{k} score={inf['score']:.3f} dur={inf['dur_min']:.1f}min "
+                f"SOC_start={inf['soc_start']} SOC_range={inf['soc_range']:.3f} "
+                f"screen_frac={inf['screen_frac']:.3f} net_std={inf['net_std']:.3f} "
+                f"[{inf['t_start']} -> {inf['t_end']}] (rows={inf['n_rows']})"
+            )
+        print("[segment] Selected segment: #1 (best score)")
+
+    return best, infos
 
 
 def resample_regular(df: pd.DataFrame, dt_s: int) -> pd.DataFrame:
     """
-    Resample time series to regular dt_s seconds grid.
-    Numeric columns -> mean; SOC -> last (ffill); timestamp becomes index then back.
+    Resample time series to a regular dt_s seconds grid.
+
+    - Most numeric columns -> mean
+    - soc_meas -> last, then forward-fill
+    - collected -> max (so it stays 1 if any sample in the bin was collected==1)
+
+    Note: Using mean() for 'collected' can create many 0.9/0.8 values after resampling, which makes
+    a strict (collected==1) filter overly aggressive.
     """
     d = df.sort_values("timestamp").copy()
     d = d.set_index("timestamp")
 
     num_cols = d.select_dtypes(include=[np.number]).columns.tolist()
-    # exclude soc_meas for special handling
     soc_col = "soc_meas" if "soc_meas" in d.columns else None
     if soc_col in num_cols:
         num_cols.remove(soc_col)
 
     out_num = d[num_cols].resample(f"{dt_s}s").mean()
+
+    if "collected" in d.columns:
+        out_num["collected"] = d["collected"].resample(f"{dt_s}s").max()
 
     out = out_num
     if soc_col is not None:
@@ -205,8 +303,6 @@ def resample_regular(df: pd.DataFrame, dt_s: int) -> pd.DataFrame:
 
     out = out.reset_index()
     return out
-
-
 def interp1d(x: np.ndarray, y: np.ndarray):
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -258,32 +354,50 @@ def cmd_run(args) -> int:
     feat_df["T_C"] = pd.to_numeric(dyn.get("battery_temperature", np.nan), errors="coerce").to_numpy()
     feat_df["battery_connection_status"] = pd.to_numeric(dyn.get("battery_connection_status", 0), errors="coerce").fillna(0).to_numpy()
 
-    # select discharge segment (longest)
-    seg = select_longest_discharge_segment(feat_df, gap_s=args.gap)
+    # Select a discharge segment for evaluation.
+    # IMPORTANT: do NOT always pick the *longest* segment. On some days, the longest segment may start at very low SOC
+    # (e.g., 7%) where the reported SOC is quantized and nearly constant, causing a flat "measured" SOC curve.
+    # We choose a "best" segment by a score that prefers higher SOC and more SOC variation.
+    seg_best, _ = select_best_discharge_segment(feat_df, gap_s=args.gap, verbose=True)
+
+    # Optionally limit evaluation to first N hours (faster demo)
+    seg_eval_raw = seg_best
     if args.hours is not None:
-        # limit to first N hours for faster demo
-        t0 = seg["timestamp"].iloc[0]
-        seg = seg[seg["timestamp"] <= t0 + pd.Timedelta(hours=float(args.hours))].copy()
+        t0_eval = seg_eval_raw["timestamp"].iloc[0]
+        seg_eval_raw = seg_eval_raw[seg_eval_raw["timestamp"] <= t0_eval + pd.Timedelta(hours=float(args.hours))].copy()
 
-    # resample to regular grid
-    seg = resample_regular(seg, dt_s=args.dt)
+    # Resample evaluation segment to regular grid
+    seg = resample_regular(seg_eval_raw, dt_s=args.dt)
 
-    # fit power model
+    # Build training set for power weights: concatenate up to 3 best discharge segments (by the same score)
+    # until we have enough rows. This helps avoid "all-zero" weights when one segment is too idle (screen always off, etc.).
+    segs_all = find_discharge_segments(feat_df, gap_s=args.gap, min_len=50)
+    scored_all: list[tuple[float, pd.DataFrame, dict]] = []
+    for g in segs_all:
+        sc, info = _score_segment(g)
+        scored_all.append((sc, g, info))
+    scored_all.sort(key=lambda x: x[0], reverse=True)
+
+    train_parts: list[pd.DataFrame] = []
+    total_rows = 0
+    for sc, g, info in scored_all[:5]:  # consider top 5, but keep only first few needed
+        rs = resample_regular(g, dt_s=args.dt)
+        train_parts.append(rs)
+        total_rows += len(rs)
+        if total_rows >= 2000 or len(train_parts) >= 3:
+            break
+    train_df = pd.concat(train_parts, ignore_index=True) if len(train_parts) else seg
+
+    print(f"[train] Using {len(train_parts)} segment(s), total train rows={len(train_df)} (dt={args.dt}s)")
+
+    # Fit power model
     power_model = fit_linear_power_model(
-        seg,
+        train_df,
         feature_cols=feature_cols,
         alpha=args.ridge_alpha,
         use_only_collected1=not args.use_all_rows,
         verbose=True,
     )
-
-    model_path = Path(args.out_model)
-    power_model.save(model_path)
-
-    # predict power for segment
-    p_pred = power_model.predict_power(seg)
-    p_meas = pd.to_numeric(seg["p_load_W_meas"], errors="coerce").fillna(0.0).to_numpy()
-
     # capacity from static
     cap_mAh = load_static_battery_capacity_mAh(idx, args.date, args.device)
     if cap_mAh is None:
