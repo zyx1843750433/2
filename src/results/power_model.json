@@ -1,0 +1,45 @@
+{
+  "P0_W": 0.05574739616812704,
+  "feature_cols": [
+    "screen_on",
+    "screen_bright",
+    "cpu",
+    "cpu_freq",
+    "net",
+    "wifi_weak",
+    "gps",
+    "bg"
+  ],
+  "weights": {
+    "screen_on": 0.0,
+    "screen_bright": 0.0,
+    "cpu": 0.005381250252592109,
+    "cpu_freq": 0.35633123851535986,
+    "net": 0.0,
+    "wifi_weak": 0.015498429062480881,
+    "gps": 0.0,
+    "bg": 0.0
+  },
+  "scaler": {
+    "feature_mins": {
+      "screen_on": 0.0,
+      "screen_bright": 0.0,
+      "cpu": 19.57885997096685,
+      "cpu_freq": 1284.8871368588793,
+      "net": 0.0,
+      "wifi_weak": 0.0,
+      "gps": 1.0,
+      "bg": 0.0
+    },
+    "feature_maxs": {
+      "screen_on": 0.0,
+      "screen_bright": 0.0,
+      "cpu": 84.77799185485279,
+      "cpu_freq": 1587.803363518758,
+      "net": 6.632001777395631,
+      "wifi_weak": 0.5571428571428572,
+      "gps": 1.0,
+      "bg": 0.0
+    }
+  }
+}
