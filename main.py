@@ -418,6 +418,10 @@ def cmd_run(args) -> int:
     t_s = (seg["timestamp"] - t0).dt.total_seconds().to_numpy(dtype=float)
     t_end = float(t_s[-1])
 
+    # predicted/measured power series
+    p_pred = power_model.predict_power(seg)
+    p_pred = np.nan_to_num(p_pred, nan=0.0, posinf=0.0, neginf=0.0)
+    p_meas = pd.to_numeric(seg["p_load_W_meas"], errors="coerce").to_numpy(dtype=float)
     # build power function for ODE
     P_fun = interp1d(t_s, p_pred.clip(min=0.0))
 
